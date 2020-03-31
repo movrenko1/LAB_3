@@ -1,0 +1,193 @@
+---
+title: "lab_3_server"
+author: "Movrenko Anna"
+date: '27 марта 2020 г '
+output: html_document
+---
+
+```{r }
+library('shiny')              # загрузка пакетов
+library('dplyr')
+library('data.table')
+library('zoo')
+library('lubridate')
+library('ggplot2')
+
+# загружаем файл с данными по импорту масла в РФ (из прошлой практики)
+fileURL <- 'https://raw.githubusercontent.com/aksyuk/R-data/master/COMTRADE/040510-Imp-RF-comtrade.csv'
+# создаём директорию для данных, если она не существует:
+if (!file.exists('./data')) dir.create('./data')
+# загружаем файл, если он не существует
+if (!file.exists('./data/040510-Imp-RF-comtrade.csv')) {
+  download.file(fileURL, './data/040510-Imp-RF-comtrade.csv')}
+# читаем данные из загруженного .csv во фрейм
+DT.import <- data.table(read.csv('./data/040510-Imp-RF-comtrade.csv', as.is = T))
+# переводим период в дату: начало соответствующего месяца
+#  нелогично, но ceiling_date, с помощью которого дата округлялась 
+#  до следующего месяца ранее, выдаёт ошибку: не распознаёт timezone
+DT.import[, Period.Date := 
+            as.POSIXct(as.yearmon(as.character(Period), 
+                                  '%Y%m'))]
+
+# сколько NA в каждом из оставшихся столбцов?
+na.num <- sapply(DT.import, function(x) sum(is.na(x)))
+# выводим только положительные и по убыванию
+sort(na.num[na.num >0], decreasing = T)
+
+
+# явное преобразование типа, чтобы избежать проблем 
+#  при заполнении пропусков
+DT.import[, Netweight.kg := as.double(Netweight.kg)]
+# считаем медианы и округляем до целого, как исходные данные
+DT.import[, round(median(.SD$Netweight.kg, na.rm = T), 0),
+          by= Year]
+
+# сначала копируем все значения
+DT.import[, Netweight.kg.median := round(median(.SD$Netweight.kg, na.rm = T), 0), by = Year]
+
+# затем заменяем пропуски на медианы
+DT.import[!is.na(Netweight.kg), Netweight.kg.median := Netweight.kg]
+
+# смотрим результат
+DT.import[, Netweight.kg, Netweight.kg.median]
+DT.import[is.na(Netweight.kg), Year, Netweight.kg.median]
+
+
+
+#выбираем нужные столбцы
+DT.import
+# убираем столбец с периодом в виде текста, оставляем только дату
+DT.import <- select(DT.import, Period.Date,Trade.Flow, Commodity.Code, 
+                    Commodity, Reporter, Trade.Value.USD, Year, 
+                    Netweight.kg.median)
+DT.import$group = transmute(DT.import, 
+                            group = DT.import$Reporter)
+DT.import$group[DT.import$group  ==  "Kazakhstan"] = 0
+DT.import$group[DT.import$group  ==  "Russian Federation"] = 0
+DT.import$group[DT.import$group  ==  "Belarus"] = 0
+DT.import$group[DT.import$group  ==  "Armenia"] = 0
+DT.import$group[DT.import$group  ==  "Kyrgyzstan "] = 0
+DT.import$group[DT.import$group  ==  "Azerbaijan"] = 1
+DT.import$group[DT.import$group  ==  "Ukraine"] = 1
+DT.import$group[DT.import$group == "United States of America"] = 2
+DT.import$group[DT.import$group  ==  "Georgia"] = 2
+DT.import$group[DT.import$group  ==  "Lithuania"] = 2
+DT.import$group[DT.import$group  ==  "United Arab Emirates"] = 2
+DT.import$group[DT.import$group  ==  "Slovenia"] = 2
+DT.import$group[DT.import$group  ==  "EU-28"] = 2
+DT.import$group[DT.import$group  ==  "Mongolia"] = 2
+DT.import$group[DT.import$group  ==  ""] = 2
+DT.import[, СтраныПоставщики := factor(group, levels = c(0, 1 , 2),
+                                       labels = c('ТС',
+                                                  'СНГ',
+                                                  'остальные'))]
+#DT.import <- select(DT.import, Year, Netweight.kg.median, СтраныПоставщики)
+#DT.import <- DT.import[, lapply(.SD, sum), by = c('СтраныПоставщики' , 'Year')]
+
+# серверная часть приложения shiny
+shinyServer(function(input, output) {
+  # список стран для выбора
+  output$stateList <- renderUI({
+    state.list <- sort(unique(DT.import$СтраныПоставщики))
+    state.list <- state.list[state.list != ""]
+    radioButtons('state',   # связанная переменная
+                 'Выберите торгового партнёра:', state.list, 
+                 selected = state.list[1])
+  })
+  output$tradeflow <- renderUI({
+    t.f <- sort(unique(DT.import$Trade.Flow))
+    radioButtons('tradeflow',   # связанная переменная
+                 'Выберите товарный поток:', t.f, 
+                 selected = t.f[1])
+  })
+  output$commoditycode <- renderUI({
+    com.c <- sort(unique(DT.import$Commodity.Code))
+    radioButtons('commoditycode',   # связанная переменная
+                 'Выберите код товара :', com.c, 
+                 selected = com.c[1])
+  })
+  # реагирующая таблица данных
+  DT <- reactive({
+    # фильтруем по годам
+    DT <- filter(DT.import, between(year(Period.Date), 
+                                    input$year.range[1],
+                                    input$year.range[2]))
+    # агрегируем
+    if (input$period.name == 'Месяц') {
+      DT <- filter(DT, СтраныПоставщики == input$state, 
+                   Trade.Flow == input$tradeflow, 
+                   Commodity.Code == input$commoditycode) %>%
+        mutate(period = as.yearmon(Period.Date))
+      
+    } else {
+      DT <- 
+        DT <- filter(DT, СтраныПоставщики == input$state, 
+                     Trade.Flow == input$tradeflow,
+                     Commodity.Code == input$commoditycode) %>%
+        mutate(period = as.yearqtr(Period.Date)) 
+    }
+    DT <- DT %>% group_by(period) %>%
+      mutate(Netweight.kg.median = sum(Netweight.kg.median))
+    
+    DT <- data.table(DT)
+    # добавляем ключевой столбец: период времени
+    setkey(DT, 'period')
+    # оставляем только уникальные периоды времени
+    DT <- data.table(unique(DT))
+  })
+  
+  # текст
+  output$text <- renderText({input$state}) 
+  output$text1 <- renderText({input$tradeflow}) 
+  output$text2 <- renderText({input$commoditycode})  
+  
+  # график динамики
+  output$ts.plot <- renderPlot({
+    if (input$state == 'ТС') {
+      gp <- ggplot(DT(),aes(x = period, y = Netweight.kg.median,col = 'red'))
+      if (input$period.name == 'Месяц') {
+        gp + geom_histogram(stat = 'identity',col = 'yellow') + 
+          scale_x_yearmon(format = "%b %Y")
+      } else {
+        gp + geom_histogram(stat = 'identity', col = 'orange') + 
+          scale_x_yearqtr(format = "%YQ%q")
+      }
+    }
+    else 
+    {
+      gp <- ggplot(DT(), aes(x = period, y = Netweight.kg.median, col = 'blue'))
+      if (input$period.name == 'Месяц') {
+        gp + geom_histogram(stat = 'identity', col = 'green') + 
+          scale_x_yearmon(format = "%b %Y")
+      } else {
+        gp + geom_histogram(stat = 'identity',col = 'pink') + 
+          scale_x_yearqtr(format = "%YQ%q")
+      }
+    }
+  }
+  )
+  
+  # таблица данных в отчёте
+  output$table <- renderDataTable({
+    DT()
+  }, options = list(lengthMenu = c(5, 10, 20), pageLength = 5))
+  
+  # событие "нажатие на кнопку 'сохранить'"
+  observeEvent(input$save.csv, {
+    if (input$period.name == 'Месяц') {
+      by.string <- '_by_mon_'
+    } else {
+      by.string <- '_by_qrt_'
+    }
+    file.name <- paste('import_', input$year.range[1], '-',
+                       input$year.range[2], by.string, 'from_',
+                       input$state, '.csv', 
+                       sep = '')
+    # файл будет записан в директорию приложения
+    write.csv(DT(), file = file.name, 
+              fileEncoding = 'UTF-8', row.names = F)
+  })
+})
+
+```
+
